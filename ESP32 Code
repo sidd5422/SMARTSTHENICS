@@ -1,0 +1,130 @@
+#include <Wire.h>
+#include <U8g2lib.h>
+#include <HX711.h>
+
+#define HX711_DT   18
+#define HX711_SCK  19
+#define OLED_SDA   21
+#define OLED_SCL   22
+
+U8G2_SH1106_128X64_NONAME_1_HW_I2C oled(U8G2_R0, U8X8_PIN_NONE);
+HX711 scale;
+
+// ⚠️ CHANGE THIS VALUE. Iske bina device hamesha stuck/galat reading dega.
+float CALIBRATION_FACTOR = 381000.0; 
+
+const float START_FORCE_KG = 1.0;       // 1kg pe rep start
+const float MIN_PEAK_FORCE_KG = 1.5;    // Minimum 1.5kg khichna hoga
+const float REP_DROP_KG = 0.8;          // 0.8kg drop hone pe rep count
+const float REARM_FORCE_KG = 0.5;       // Wapas 0.5kg pe aane pe naya rep ready
+const float FILTER_ALPHA = 0.30;
+const unsigned long MIN_REP_TIME = 250;
+const unsigned long DROP_CONFIRM_TIME = 100;
+const unsigned long MIN_REP_GAP = 300;
+const unsigned long SERIAL_INTERVAL = 200;
+
+// Scientific Bicep Curl Calorie Base
+const float CALORIES_PER_REP = 0.07;
+
+float filteredForceKg = 0.0, peakForceKg = 0.0, caloriesBurned = 0.0;
+unsigned long repCount = 0, repStartTime = 0, dropStartTime = 0, lastRepTime = 0, lastSerialUpdate = 0;
+bool firstForceReading = true;
+
+enum RepState { RESTING, TRACKING, CONFIRMING_DROP, WAITING_REARM };
+RepState repState = RESTING;
+
+void setup() {
+  Serial.begin(115200);
+  Wire.begin(OLED_SDA, OLED_SCL);
+  
+  oled.begin();
+  oled.clearBuffer();
+  oled.setFont(u8g2_font_6x10_tf);
+  oled.drawStr(22, 10, "SMARTSTHENICS");
+  oled.drawStr(10, 26, "1 ready");
+  oled.drawStr(10, 42, "2 for");
+  oled.drawStr(10, 58, "3 change");
+  oled.sendBuffer();
+  delay(2000);
+
+  scale.begin(HX711_DT, HX711_SCK);
+  scale.set_scale(CALIBRATION_FACTOR);
+  delay(500); 
+  scale.tare(20);
+}
+
+void loop() {
+  if (scale.is_ready()) {
+    float rawForce = scale.get_units(2); 
+    if (rawForce < 0) rawForce = rawForce * -1.0; 
+    if (rawForce < 0.05) rawForce = 0.0; 
+    
+    filteredForceKg = firstForceReading ? rawForce : (filteredForceKg * (1.0 - FILTER_ALPHA)) + (rawForce * FILTER_ALPHA);
+    firstForceReading = false;
+    
+    updateRepDetection(filteredForceKg);
+    updateDisplay();
+    updateSerial();
+  }
+}
+
+void updateRepDetection(float forceKg) {
+  unsigned long now = millis();
+  
+  switch (repState) {
+    case RESTING:
+      peakForceKg = 0.0;
+      if (forceKg >= START_FORCE_KG) { repState = TRACKING; repStartTime = now; peakForceKg = forceKg; }
+      break;
+      
+    case TRACKING:
+      if (forceKg > peakForceKg) peakForceKg = forceKg;
+      if ((now - repStartTime) >= MIN_REP_TIME && peakForceKg >= MIN_PEAK_FORCE_KG && 
+          forceKg <= (peakForceKg - REP_DROP_KG) && (now - lastRepTime) >= MIN_REP_GAP) {
+        dropStartTime = now; 
+        repState = CONFIRMING_DROP;
+      }
+      break;
+      
+    case CONFIRMING_DROP:
+      if (forceKg > (peakForceKg - REP_DROP_KG)) { 
+        repState = TRACKING; 
+        dropStartTime = 0; 
+      }
+      else if ((now - dropStartTime) >= DROP_CONFIRM_TIME) {
+        repCount++; 
+        caloriesBurned += (CALORIES_PER_REP + (peakForceKg * 0.002));
+        lastRepTime = now; 
+        peakForceKg = 0.0; 
+        repState = WAITING_REARM;
+      }
+      break;
+      
+    case WAITING_REARM:
+      if (forceKg <= REARM_FORCE_KG) { repState = RESTING; peakForceKg = 0.0; }
+      break;
+  }
+}
+
+void updateDisplay() {
+  oled.firstPage();
+  do {
+    oled.setFont(u8g2_font_6x10_tf);
+    oled.drawStr(22, 10, "SMARTSTHENICS");
+    
+    oled.setFont(u8g2_font_7x14B_tf);
+    oled.setCursor(0, 28); oled.print("Force: "); oled.print(filteredForceKg, 1); oled.print("kg");
+    oled.setCursor(0, 46); oled.print("Reps:  "); if (repCount < 10) oled.print("0"); oled.print(repCount);
+    oled.setCursor(0, 63); oled.print("Cal:   "); oled.print(caloriesBurned, 2); oled.print("kcal");
+  } while (oled.nextPage());
+}
+
+void updateSerial() {
+  if (millis() - lastSerialUpdate >= SERIAL_INTERVAL) {
+    lastSerialUpdate = millis();
+    Serial.print("F:"); Serial.print(filteredForceKg, 1);
+    Serial.print(" P:"); Serial.print(peakForceKg, 1);
+    Serial.print(" R:"); Serial.print(repCount);
+    Serial.print(" C:"); Serial.println(caloriesBurned, 2);
+  }
+}
